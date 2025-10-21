@@ -6,6 +6,8 @@ import random
 import math
 import sys
 import os
+import sqlite3
+import time
 
 # Initialize MediaPipe Hand
 mp_hands = mp.solutions.hands
@@ -30,6 +32,94 @@ clock = pygame.time.Clock()
 font = pygame.font.SysFont('comicsans', 36)
 small_font = pygame.font.SysFont('comicsans', 24)
 
+# -------------------- High scores (SQLite) --------------------
+DB_PATH = os.path.join(os.path.dirname(__file__), 'scores.db')
+
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def add_score(name: str, score_value: int, level: str = 'unknown', duration_sec: int = 0):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        # ensure columns exist (migration)
+        try:
+            cur.execute("ALTER TABLE scores ADD COLUMN level TEXT DEFAULT 'unknown'")
+        except Exception:
+            pass
+        try:
+            cur.execute("ALTER TABLE scores ADD COLUMN duration_sec INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        cur.execute(
+            "INSERT INTO scores(name, score, level, duration_sec) VALUES (?, ?, ?, ?)",
+            (name, int(score_value), level, int(duration_sec)),
+        )
+        conn.commit()
+    except Exception as e:
+        print('Score save failed:', e)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def get_top_scores(limit: int = 5):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        # include level and duration if present
+        try:
+            cur.execute("SELECT name, score, level, duration_sec, created_at FROM scores ORDER BY score DESC, created_at ASC LIMIT ?", (limit,))
+        except Exception:
+            cur.execute("SELECT name, score, created_at FROM scores ORDER BY score DESC, created_at ASC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        return rows
+    except Exception as e:
+        print('Read scores failed:', e)
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def get_time_played_by_level():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT level, COALESCE(SUM(duration_sec),0), COUNT(*) FROM scores GROUP BY level ORDER BY 2 DESC")
+            return cur.fetchall()
+        except Exception:
+            return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# Ensure scores database exists
+init_db()
+
 def render_text_centered(text, font_obj, color, y, outline=True):
     surf = font_obj.render(text, True, color)
     x = WIDTH//2 - surf.get_width()//2
@@ -41,22 +131,36 @@ def render_text_centered(text, font_obj, color, y, outline=True):
 
 # Load PNG images with 3D effects
 try:
-    # Load and scale images
-    banana_img = pygame.image.load('banana.png').convert_alpha()
-    # Prefer new coconut at assets/coconut.png if present
-    coconut_path = 'assets/coconut.png'
-    if os.path.exists(coconut_path):
-        coconut_img = pygame.image.load(coconut_path).convert_alpha()
+    # Banana: prefer assets path if present
+    banana_path = 'assets/banana.png' if os.path.exists('assets/banana.png') else 'banana.png'
+    banana_img = pygame.image.load(banana_path).convert_alpha()
+    if banana_path.startswith('assets'):
+        print('Loaded banana from', banana_path)
+
+    # Coconut: already prefers assets, but keep fallback
+    coconut_path = 'assets/coconut.png' if os.path.exists('assets/coconut.png') else 'coconut.png'
+    coconut_img = pygame.image.load(coconut_path).convert_alpha()
+    if coconut_path.startswith('assets'):
         print('Loaded coconut from', coconut_path)
-    else:
-        coconut_img = pygame.image.load('coconut.png').convert_alpha()
-    bomb_img = pygame.image.load('bomb.png').convert_alpha()
-    
+
+    # Bomb (static fallback): try assets then root, support .png or .gif
+    bomb_path = None
+    for candidate in ['assets/bomb.png', 'assets/bomb.gif', 'bomb.png', 'bomb.gif']:
+        if os.path.exists(candidate):
+            bomb_path = candidate
+            break
+    if bomb_path is None:
+        # If nothing found, raise to trigger color fallbacks
+        raise FileNotFoundError('No bomb image found in assets/ or project root')
+    bomb_img = pygame.image.load(bomb_path).convert_alpha()
+    if bomb_path.startswith('assets'):
+        print('Loaded bomb from', bomb_path)
+
     # Scale images to game size
     banana_img = pygame.transform.scale(banana_img, (80, 80))
     coconut_img = pygame.transform.scale(coconut_img, (80, 80))
     bomb_img = pygame.transform.scale(bomb_img, (80, 80))
-    
+
     images_loaded = True
     print("Images loaded successfully!")
 except:
@@ -99,6 +203,10 @@ frame_count = 0
 game_state = 'main_menu'  # New distinct main menu before difficulty selection
 selected_difficulty = None
 main_menu_index = 0  # Tracks which button is selected on the main menu
+score_saved = False  # avoid saving the same score multiple times per session
+player_name = ''
+name_input_text = ''
+session_start_time = 0.0
 
 # Attempt to load UI background image (robust path attempts)
 ui_bg = None
@@ -141,7 +249,7 @@ UI_BUTTON_HOVER = (140, 100, 70)
 UI_BUTTON_BORDER = (40, 25, 15)
 UI_BACKDROP_TINT = (30, 20, 10)
 
-MAIN_MENU_BUTTONS = ["START", "OPTIONS", "CREDITS", "EXIT"]
+MAIN_MENU_BUTTONS = ["START", "LEADERBOARD", "OPTIONS", "CREDITS", "EXIT"]
 
 def draw_main_menu(selected_index: int):
     # Draw background image or tinted fallback
@@ -340,6 +448,77 @@ def draw_menu(paused=False):
     screen.blit(quit_text, (WIDTH//2 - quit_text.get_width()//2, HEIGHT - 50))
     pygame.display.flip()
 
+def format_duration(seconds: int) -> str:
+    try:
+        seconds = int(seconds)
+    except Exception:
+        seconds = 0
+    m, s = divmod(max(0, seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+def draw_leaderboard():
+    screen.fill((25, 25, 35))
+    title = font.render('LEADERBOARD', True, (255, 230, 180))
+    screen.blit(title, (WIDTH//2 - title.get_width()//2, 40))
+
+    # Top 5 scores
+    try:
+        top5 = get_top_scores(5)
+    except Exception:
+        top5 = []
+    header = small_font.render('Top 5 Scores', True, (230, 210, 200))
+    screen.blit(header, (WIDTH//2 - header.get_width()//2, 100))
+    y = 130
+    for i, row in enumerate(top5):
+        if len(row) >= 5:
+            name, s, lvl, dur, created = row
+            line_txt = f"{i+1}. {name[:12]:<12}  {s:>3}  [{lvl}]  {format_duration(dur)}"
+        else:
+            name, s, created = row
+            line_txt = f"{i+1}. {name[:12]:<12}  {s:>3}"
+        line = small_font.render(line_txt, True, (220,220,220))
+        screen.blit(line, (WIDTH//2 - line.get_width()//2, y + i*26))
+
+    # Time played by level
+    y2 = y + 26*6
+    sub = small_font.render('Time Played by Level', True, (230, 210, 200))
+    screen.blit(sub, (WIDTH//2 - sub.get_width()//2, y2))
+    agg = get_time_played_by_level()
+    for j, row in enumerate(agg):
+        lvl, total_sec, cnt = row
+        ln = small_font.render(f"{lvl.title():<7}  {format_duration(total_sec)}  ({cnt} runs)", True, (210,210,210))
+        screen.blit(ln, (WIDTH//2 - ln.get_width()//2, y2 + 30 + j*24))
+
+    back = small_font.render('Press ESC or M to return', True, (200, 200, 200))
+    screen.blit(back, (WIDTH//2 - back.get_width()//2, HEIGHT - 60))
+    pygame.display.flip()
+
+def draw_name_entry(current_text: str):
+    screen.fill((20, 25, 35))
+    title = font.render('ENTER YOUR NAME', True, (255, 230, 180))
+    screen.blit(title, (WIDTH//2 - title.get_width()//2, 80))
+
+    # Input panel
+    panel = pygame.Rect(0, 0, 520, 80)
+    panel.center = (WIDTH//2, 220)
+    pygame.draw.rect(screen, (60, 60, 80), panel, border_radius=10)
+    inner = panel.inflate(-10, -10)
+    pygame.draw.rect(screen, (120, 120, 160), inner, border_radius=10)
+
+    # Show typed text or placeholder
+    shown = current_text if current_text else 'Type name...'
+    color = (255,255,255) if current_text else (200,200,220)
+    txt = font.render(shown, True, color)
+    screen.blit(txt, (inner.x + 14, inner.y + 18))
+
+    # Instructions
+    note = small_font.render('Letters, numbers, space, _ and - (max 12).', True, (220, 220, 220))
+    screen.blit(note, (WIDTH//2 - note.get_width()//2, 320))
+    hint = small_font.render('ENTER: Continue   |   ESC: Back to Menu', True, (200, 200, 200))
+    screen.blit(hint, (WIDTH//2 - hint.get_width()//2, HEIGHT - 80))
+    pygame.display.flip()
+
 def draw_game_over():
     screen.fill((40, 20, 20))
     game_over_text = font.render('GAME OVER', True, (255, 100, 100))
@@ -353,6 +532,25 @@ def draw_game_over():
     
     restart_text = font.render('R: Restart | M: Menu | Q: Quit', True, (255, 255, 255))
     screen.blit(restart_text, (WIDTH//2 - restart_text.get_width()//2, 350))
+
+    # Top 5 scores
+    try:
+        top5 = get_top_scores(5)
+        header = small_font.render('TOP SCORES', True, (255, 220, 180))
+        screen.blit(header, (WIDTH//2 - header.get_width()//2, 400))
+        base_y = 430
+        for i, row in enumerate(top5):
+            if len(row) >= 5:
+                name, s, lvl, dur, created_at = row
+                txt = f"{i+1}. {name[:12]:<12}  {s}  [{lvl}]  {format_duration(dur)}"
+            else:
+                name, s, created_at = row
+                txt = f"{i+1}. {name[:12]:<12}  {s}"
+            line = small_font.render(txt, True, (230, 210, 200))
+            screen.blit(line, (WIDTH//2 - line.get_width()//2, base_y + i*26))
+    except Exception as e:
+        err = small_font.render(f"Scores unavailable: {e}", True, (255, 180, 180))
+        screen.blit(err, (WIDTH//2 - err.get_width()//2, 400))
     pygame.display.flip()
 
 # Webcam setup
@@ -499,13 +697,14 @@ def update_particles():
                              (int(particle['x']), int(particle['y'])), size)
 
 def reset_game():
-    global score, lives, objects, frame_count
+    global score, lives, objects, frame_count, score_saved
     if selected_difficulty:
         config = DIFFICULTY_CONFIG[selected_difficulty]
         lives = config['lives']
         score = 0
         objects = []
         frame_count = 0
+        score_saved = False
 
 # Finger sprite (animated) setup
 finger_frames = []
@@ -523,24 +722,34 @@ JUMP_STRENGTH = -18.0
 GRAVITY = 1.0
 JUMP_COOLDOWN_FRAMES = 25
 last_jump_frame = -999
+prev_raw_tip_y = None
+prev_raw_tip_frame = -999
+JUMP_TRIGGER_DELTA = 50  # px upward within recent frames triggers jump
+JUMP_TRIGGER_WINDOW = 8  # frames window to consider rapid upward motion
 
 def update_pointer(monkey_tip_raw, frame_count):
     """Update constrained pointer position.
     Horizontal follows raw x; vertical fixed unless jumping. Jump triggers when
     raw finger y is raised above top threshold quickly while pointing.
     """
-    global pointer_x, pointer_y, jump_active, jump_velocity, last_jump_frame
+    global pointer_x, pointer_y, jump_active, jump_velocity, last_jump_frame, prev_raw_tip_y, prev_raw_tip_frame
     # Follow horizontal smoothly
     if monkey_tip_raw:
         target_x = monkey_tip_raw[0]
         pointer_x += int((target_x - pointer_x) * 0.25)  # smoothing
 
-    # Jump initiation condition: raw y in upper 1/3 of frame
-    if (monkey_tip_raw and monkey_tip_raw[1] < HEIGHT * 0.33 and
-        frame_count - last_jump_frame > JUMP_COOLDOWN_FRAMES and not jump_active):
-        jump_active = True
-        jump_velocity = JUMP_STRENGTH
-        last_jump_frame = frame_count
+    # Jump initiation conditions
+    if monkey_tip_raw and not jump_active and (frame_count - last_jump_frame > JUMP_COOLDOWN_FRAMES):
+        # 1) Rapid upward motion (more forgiving and closer to previous behavior)
+        if prev_raw_tip_y is not None and (prev_raw_tip_y - monkey_tip_raw[1] >= JUMP_TRIGGER_DELTA) and (frame_count - prev_raw_tip_frame <= JUMP_TRIGGER_WINDOW):
+            jump_active = True
+            jump_velocity = JUMP_STRENGTH
+            last_jump_frame = frame_count
+        # 2) Or absolute top-third threshold
+        elif monkey_tip_raw[1] < HEIGHT * 0.33:
+            jump_active = True
+            jump_velocity = JUMP_STRENGTH
+            last_jump_frame = frame_count
 
     if jump_active:
         jump_velocity += GRAVITY
@@ -551,6 +760,11 @@ def update_pointer(monkey_tip_raw, frame_count):
             jump_velocity = 0.0
     else:
         pointer_y = pointer_y_base
+
+    # Track last raw tip position for velocity-style detection
+    if monkey_tip_raw:
+        prev_raw_tip_y = monkey_tip_raw[1]
+        prev_raw_tip_frame = frame_count
 
     return (pointer_x, int(pointer_y))
 
@@ -647,13 +861,51 @@ while running:
                 elif event.key == pygame.K_RETURN or event.key == pygame.K_SPACE:
                     choice = MAIN_MENU_BUTTONS[main_menu_index]
                     if choice == 'START':
-                        game_state = 'menu'  # Go to difficulty selection (legacy menu)
+                        # If we don't yet have a name, ask for it first
+                        game_state = 'name_entry' if not player_name else 'menu'
                     elif choice == 'OPTIONS':
                         game_state = 'options'
                     elif choice == 'CREDITS':
                         game_state = 'credits'
+                    elif choice == 'LEADERBOARD':
+                        game_state = 'leaderboard'
                     elif choice == 'EXIT':
                         running = False
+        clock.tick(30)
+        continue
+
+    if game_state == 'leaderboard':
+        draw_leaderboard()
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN and (event.key == pygame.K_ESCAPE or event.key == pygame.K_m):
+                game_state = 'main_menu'
+        clock.tick(30)
+        continue
+
+    if game_state == 'name_entry':
+        draw_name_entry(name_input_text)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    game_state = 'main_menu'
+                    name_input_text = ''
+                elif event.key == pygame.K_BACKSPACE:
+                    name_input_text = name_input_text[:-1]
+                elif event.key == pygame.K_RETURN:
+                    cleaned = name_input_text.strip()
+                    if cleaned:
+                        player_name = cleaned[:12]
+                        name_input_text = ''
+                        game_state = 'menu'
+                else:
+                    ch = event.unicode
+                    if ch and (ch.isalnum() or ch in [' ', '_', '-']):
+                        if len(name_input_text) < 12:
+                            name_input_text += ch
         clock.tick(30)
         continue
 
@@ -711,8 +963,18 @@ while running:
                 elif event.key == pygame.K_s and selected_difficulty:
                     game_state = 'running'
                     reset_game()
+                    # start a new session timer
+                    session_start_time = time.time()
                 elif event.key == pygame.K_b:
                     selected_difficulty = None
+                elif event.key == pygame.K_m:
+                    # Go back to main menu from difficulty selection
+                    game_state = 'main_menu'
+                    selected_difficulty = None
+                    objects.clear()
+                    # reset basic stats for cleanliness
+                    score = 0
+                    frame_count = 0
                 elif event.key == pygame.K_q:
                     running = False
         clock.tick(10)
@@ -727,6 +989,7 @@ while running:
                 if event.key == pygame.K_r:
                     game_state = 'running'
                     reset_game()
+                    session_start_time = time.time()
                 elif event.key == pygame.K_m:
                     game_state = 'menu'
                     selected_difficulty = None
@@ -830,6 +1093,16 @@ while running:
 
     # Check for game over
     if lives <= 0:
+        # Save score once when we first hit game over
+        if not score_saved:
+            duration = 0
+            try:
+                if session_start_time:
+                    duration = int(time.time() - session_start_time)
+            except Exception:
+                duration = 0
+            add_score(player_name or 'YOU', score, selected_difficulty or 'unknown', duration)
+            score_saved = True
         game_state = 'game_over'
 
     # Draw enhanced HUD
